@@ -1,4 +1,4 @@
-name: Holo v11 Check
+name: Holo v11 Check & Native Release
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   holo-v11-verify:
@@ -21,12 +21,127 @@ jobs:
         run: |
           set -euo pipefail
           test -f README.md || test -f readme.md
+          test -f CMakeLists.txt
           test -d .github/workflows
           WF_COUNT=$(find .github/workflows -maxdepth 1 -type f | wc -l)
           echo "Holo v11 structure verified for llama.cpp (workflows: ${WF_COUNT})"
           {
-            printf '### Holo v11 Repository Check — llama.cpp\n\n'
-            printf '- **Branch:** `master`\n'
-            printf '- **Workflow Count:** `%s`\n' "${WF_COUNT}"
-            printf '- **Status:** Structure verified (Holo v11 unified)\n'
+            printf '%s\n' '### Holo v11 Repository Check — llama.cpp'
+            printf '\n'
+            printf '%s\n' '- **Branch:** `master`'
+            printf '%s\n' "- **Workflow Count:** \`${WF_COUNT}\`"
+            printf '%s\n' '- **Status:** Structure verified (Holo v11 unified)'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-release:
+    name: Build Linux x86_64 & Publish Holo v11 Release
+    needs: holo-v11-verify
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure and build llama-cli (Release, shared libs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_CURL=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --target llama-cli -j "$(nproc)"
+
+      - name: Smoke test llama-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          LD_LIBRARY_PATH="$(pwd)/build/bin:${LD_LIBRARY_PATH:-}" ./build/bin/llama-cli --version
+          ls -la build/bin/llama-cli build/bin/libllama*.so* build/bin/libggml*.so*
+
+      - name: Package tarball, SHA512SUMS.txt, and holo-v11-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf staging dist
+          mkdir -p staging dist
+
+          cp -a build/bin/llama-cli staging/
+          cp -a build/bin/*.so* staging/
+
+          (
+            cd staging
+            find . -maxdepth 1 \( -type f -o -type l \) ! -name 'SHA512SUMS.txt' ! -name 'holo-v11-manifest.json' -printf '%f\n' \
+              | LC_ALL=C sort \
+              | while IFS= read -r f; do
+                  if [ -f "$f" ] && [ ! -L "$f" ]; then
+                    sha512sum "$f"
+                  fi
+                done > SHA512SUMS.txt
+          )
+
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, datetime
+
+          staging = pathlib.Path("staging")
+          files = []
+          for p in sorted(staging.iterdir()):
+              if p.name in ("SHA512SUMS.txt", "holo-v11-manifest.json"):
+                  continue
+              if p.is_symlink():
+                  files.append({
+                      "name": p.name,
+                      "type": "symlink",
+                      "target": os.readlink(p),
+                  })
+              elif p.is_file():
+                  h = hashlib.sha512()
+                  with p.open("rb") as f:
+                      for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                          h.update(chunk)
+                  files.append({
+                      "name": p.name,
+                      "type": "file",
+                      "bytes": p.stat().st_size,
+                      "sha512": h.hexdigest(),
+                  })
+
+          manifest = {
+              "schema": "holo-v11-manifest/v1",
+              "repo": os.environ["GITHUB_REPOSITORY"],
+              "tag": "v11-llama-cpp-latest",
+              "commit": os.environ["GITHUB_SHA"],
+              "target": "linux-x86_64",
+              "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "artifacts": files,
+          }
+          out = json.dumps(manifest, indent=2) + "\n"
+          (staging / "holo-v11-manifest.json").write_text(out, encoding="utf-8")
+          pathlib.Path("dist/holo-v11-manifest.json").write_text(out, encoding="utf-8")
+          PY
+
+          tar -C staging -czf dist/llama-cpp-linux-x86_64-holo-v11.tar.gz .
+          (
+            cd dist
+            sha512sum llama-cpp-linux-x86_64-holo-v11.tar.gz holo-v11-manifest.json > SHA512SUMS.txt
+            cat SHA512SUMS.txt
+            ls -lh
+          )
+
+      - name: Upload GitHub Release (v11-llama-cpp-latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v11-llama-cpp-latest"
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "${{ github.repository }}"
+          else
+            gh release create "$TAG" dist/* -R "${{ github.repository }}" \
+              --title "llama.cpp Holo v11 ($TAG)" \
+              --notes "Native Linux x86_64 build (llama-cli + shared libs + SHA512SUMS.txt + holo-v11-manifest.json) built from ${{ github.sha }}."
+          fi
+          gh release view "$TAG" -R "${{ github.repository }}"
